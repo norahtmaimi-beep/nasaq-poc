@@ -1,0 +1,13 @@
+{
+  "name": "nasaq-poc",
+  "version": "0.2.0",
+  "private": true,
+  "description": "نسق — PoC v2: تحليل مستأجر حسب الدومين + قاعدة بيانات Postgres حقيقية + مصادقة حقيقية",
+  "main": "Server.js",
+  "scripts": {
+    "start": "node Server.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  }
+}
