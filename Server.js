@@ -1,18 +1,28 @@
 /**
- * نسق — خادم إثبات تقني (PoC) v2
+ * نسق — خادم إثبات تقني (PoC) v3
  * ------------------------------------------------------------------
+ * إضافة عن v2: طبقة دلالية (Semantic Layer) حقيقية لمحرك BI، مو مجرد
+ * استعلام SQL مكتوب مرة وحدة. المقاييس (measures) والأبعاد (dimensions)
+ * تُعرَّف مرة وحدة في SALES_MEASURES / SALES_DIMENSIONS، ودالة
+ * queryMeasures() تبني الاستعلام ديناميكياً حسب أي مقياس/بُعد يُطلب —
+ * هذا نفس مبدأ أدوات مثل Cube.dev اللي رشّحناها بالخطة المعمارية، لكن
+ * بأبسط صورة ممكنة تثبت الفكرة. كل مستأجر عنده لوحة KPI حقيقية (مو أرقام
+ * وهمية "—") ورسمين بيانيين (اتجاه المبيعات + المبيعات حسب الفئة) مبنيين
+ * كـ SVG مباشر من نتائج الاستعلام، بدون أي مكتبة رسوم خارجية.
+ *
  * الفرق عن v1: هذا الإصدار حقيقي على مستويين كان v1 يتحايل عليهما بصراحة:
  *
  *   1) التخزين: بدل Map في الذاكرة (يُمسح عند كل إعادة تشغيل)، الآن
  *      Postgres حقيقي على Render. عند الإقلاع، الخادم ينشئ الجداول
  *      تلقائياً لو ما كانت موجودة (migrate()) ويزرع المستأجرين الثلاثة
- *      التجريبيين لو ما كانوا موجودين — بدون أي أداة SQL يدوية.
+ *      التجريبيين وبيانات مبيعات تجريبية لهم — بدون أي أداة SQL يدوية.
  *
  *   2) المصادقة: بدل "أي شخص يسجّل مستأجر تجريبي بدون حساب"، الآن فيه
  *      تسجيل حساب حقيقي بكلمة مرور (مُجزّأة بـ scrypt + ملح عشوائي —
  *      لا شيء نص صريح يُخزَّن أبداً)، ودخول يُصدر توكن جلسة موقّع
  *      (HMAC-SHA256) — بدون جدول جلسات، التوقيع نفسه هو إثبات الصلاحية.
- *      إضافة مستأجر جديد (POST /api/tenants) صار يتطلب حساباً مسجَّلاً.
+ *      إضافة مستأجر جديد أو عملية بيع جديدة يتطلب حساباً مسجَّلاً ومالكاً
+ *      فعلياً لذلك المستأجر (owner_user_id) — مو أي مستخدم مسجّل دخول.
  *
  * لا يزال هذا PoC: بدون تأكيد بريد، بدون استرجاع كلمة مرور، بدون حدود
  * معدل طلبات (rate limiting). هذا مقصود — نفس فلسفة v1: أثبت أن الآلية
@@ -66,6 +76,17 @@ async function migrate() {
       created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sales (
+      id SERIAL PRIMARY KEY,
+      tenant_hostname TEXT NOT NULL REFERENCES tenants(hostname),
+      occurred_on DATE NOT NULL,
+      category TEXT NOT NULL,
+      customer_name TEXT NOT NULL,
+      amount NUMERIC(12,2) NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
   const seed = [
     ['shorooq.' + ROOT_DOMAIN, 'شركة شروق التجارية', '#286140', '#B58500'],
     ['nova.' + ROOT_DOMAIN, 'Nova Logistics', '#B58500', '#1B365D'],
@@ -78,7 +99,71 @@ async function migrate() {
       [hostname, name, primary, accent]
     );
   }
+  await seedSalesIfEmpty();
   console.log('DB migrated + seeded.');
+}
+
+// يزرع بيانات مبيعات تجريبية واقعية (14 يوم × 3 فئات) لكل مستأجر تجريبي —
+// فقط إذا ما كان عنده أي صف مبيعات بعد (idempotent، آمن يتكرر كل إقلاع).
+const DEMO_HOSTS = ['shorooq.' + ROOT_DOMAIN, 'nova.' + ROOT_DOMAIN, 'amal.' + ROOT_DOMAIN];
+const DEMO_CATEGORIES = ['خدمات استشارية', 'اشتراكات', 'تدريب'];
+async function seedSalesIfEmpty() {
+  for (let t = 0; t < DEMO_HOSTS.length; t++) {
+    const hostname = DEMO_HOSTS[t];
+    const existing = await pool.query('SELECT 1 FROM sales WHERE tenant_hostname = $1 LIMIT 1', [hostname]);
+    if (existing.rows.length) continue;
+    const rows = [];
+    for (let dayAgo = 13; dayAgo >= 0; dayAgo--) {
+      const date = new Date(Date.now() - dayAgo * 86400000).toISOString().slice(0, 10);
+      const dealsToday = 1 + ((dayAgo + t) % 3); // 1-3 صفقات باليوم
+      for (let k = 0; k < dealsToday; k++) {
+        const catIndex = (dayAgo + k + t) % DEMO_CATEGORIES.length;
+        const amount = 400 + (((dayAgo * 37) + (k * 53) + (t * 91)) % 22) * 85;
+        const customer = `عميل ${((dayAgo + k + t) % 7) + 1}`;
+        rows.push([hostname, date, DEMO_CATEGORIES[catIndex], customer, amount]);
+      }
+    }
+    for (const row of rows) {
+      await pool.query(
+        `INSERT INTO sales (tenant_hostname, occurred_on, category, customer_name, amount) VALUES ($1,$2,$3,$4,$5)`,
+        row
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------
+// الطبقة الدلالية (Semantic Layer) — مقاييس وأبعاد تُعرَّف مرة وحدة
+// ---------------------------------------------------------------------
+const SALES_MEASURES = {
+  total_sales: { label: 'إجمالي المبيعات', sql: 'COALESCE(SUM(amount),0)::numeric', format: 'currency' },
+  active_customers: { label: 'عملاء نشطون', sql: 'COUNT(DISTINCT customer_name)', format: 'integer' },
+  avg_deal: { label: 'متوسط الصفقة', sql: 'COALESCE(AVG(amount),0)::numeric', format: 'currency' },
+  deal_count: { label: 'عدد الصفقات', sql: 'COUNT(*)', format: 'integer' },
+};
+const SALES_DIMENSIONS = {
+  day: { label: 'اليوم', sql: "to_char(occurred_on, 'YYYY-MM-DD')" },
+  category: { label: 'الفئة', sql: 'category' },
+};
+
+// يبني وينفّذ استعلاماً حسب أي تركيبة مقاييس/بُعد يُطلب — هذا هو جوهر
+// "الطبقة الدلالية": المقاييس مُعرَّفة مرة وحدة أعلاه، والاستعلام يُبنى
+// ديناميكياً، بدل ما يتكرر SQL خام بكل مكان يحتاج رقماً.
+async function queryMeasures(tenantHostname, measureKeys, dimensionKey, opts = {}) {
+  const measureSql = measureKeys.map((k) => `${SALES_MEASURES[k].sql} AS ${k}`).join(', ');
+  const params = [tenantHostname];
+  let sql;
+  if (dimensionKey) {
+    const dimSql = SALES_DIMENSIONS[dimensionKey].sql;
+    let where = 'tenant_hostname = $1';
+    if (opts.since) { params.push(opts.since); where += ` AND occurred_on >= $${params.length}`; }
+    sql = `SELECT ${dimSql} AS dim, ${measureSql} FROM sales WHERE ${where} GROUP BY dim ORDER BY dim`;
+    const r = await pool.query(sql, params);
+    return r.rows;
+  }
+  sql = `SELECT ${measureSql} FROM sales WHERE tenant_hostname = $1`;
+  const r = await pool.query(sql, params);
+  return r.rows[0];
 }
 
 async function findTenantByHost(hostname) {
@@ -173,6 +258,77 @@ function sendJson(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(obj, null, 2));
 }
+
+// ---------------------------------------------------------------------
+// تنسيق الأرقام + رسوم SVG بسيطة (بدون أي مكتبة رسوم خارجية)
+// اللوحة: التزمنا بلوحة dataviz الافتراضية المُتحقَّق منها للرسوم
+// (وليس ألوان الهوية) لأن ألوان هوية نسق فشلت فحص إمكانية الوصول
+// (contrast/CVD) عند استخدامها كألوان سلاسل بيانات — نفس القرار
+// المُوثَّق في basaer-landing.html.
+// ---------------------------------------------------------------------
+function fmtNum(n) {
+  const v = Math.round(Number(n) || 0);
+  return v.toLocaleString('en-US');
+}
+function fmtCurrency(n) {
+  return fmtNum(n) + ' ر.س';
+}
+
+function lineChartSvg(trend) {
+  const W = 640, H = 200, padL = 8, padR = 8, padT = 28, padB = 24;
+  const values = trend.map((d) => Number(d.total_sales) || 0);
+  const n = values.length || 1;
+  const max = Math.max(1, ...values);
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const x = (i) => padL + (n <= 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+  const y = (v) => padT + plotH - (v / max) * plotH;
+  const points = values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  const gridLines = [0, 0.5, 1].map((f) => {
+    const gy = padT + plotH * (1 - f);
+    return `<line x1="${padL}" y1="${gy.toFixed(1)}" x2="${W - padR}" y2="${gy.toFixed(1)}" stroke="#e1e0d9" stroke-width="1"/>`;
+  }).join('');
+  const lastI = n - 1;
+  const lastX = x(lastI), lastY = y(values[lastI] || 0);
+  const hoverDots = values.map((v, i) =>
+    `<circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="9" fill="transparent"><title>${escapeHtml(trend[i].dim)}: ${fmtCurrency(v)}</title></circle>`
+  ).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" role="img" aria-label="اتجاه المبيعات آخر 14 يوم">
+    ${gridLines}
+    <line x1="${padL}" y1="${(padT + plotH).toFixed(1)}" x2="${W - padR}" y2="${(padT + plotH).toFixed(1)}" stroke="#c3c2b7" stroke-width="1"/>
+    <polyline points="${points}" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="${lastX.toFixed(1)}" cy="${lastY.toFixed(1)}" r="4" fill="#2a78d6"/>
+    <text x="${lastX.toFixed(1)}" y="${(lastY - 12).toFixed(1)}" font-size="11" fill="#0b0b0b" text-anchor="middle">${fmtCurrency(values[lastI] || 0)}</text>
+    ${hoverDots}
+  </svg>`;
+}
+
+function barChartSvg(byCategory) {
+  const COLORS = ['#2a78d6', '#eb6834', '#1baf7a'];
+  const top = byCategory.slice(0, 3);
+  const rest = byCategory.slice(3);
+  const restTotal = rest.reduce((s, r) => s + (Number(r.total_sales) || 0), 0);
+  const bars = restTotal > 0 ? [...top, { dim: 'أخرى', total_sales: restTotal }] : top;
+  const W = 640, H = 200, padL = 8, padR = 8, padT = 28, padB = 36;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const n = Math.max(1, bars.length);
+  const gap = 20;
+  const barW = (plotW - gap * (n - 1)) / n;
+  const max = Math.max(1, ...bars.map((b) => Number(b.total_sales) || 0));
+  const parts = bars.map((b, i) => {
+    const v = Number(b.total_sales) || 0;
+    const bh = (v / max) * plotH;
+    const bx = padL + i * (barW + gap);
+    const by = padT + plotH - bh;
+    const color = COLORS[i] || '#898781';
+    return `<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(bh, 1).toFixed(1)}" rx="4" fill="${color}"><title>${escapeHtml(b.dim)}: ${fmtCurrency(v)}</title></rect>
+      <text x="${(bx + barW / 2).toFixed(1)}" y="${(by - 8).toFixed(1)}" font-size="11" fill="#0b0b0b" text-anchor="middle">${fmtCurrency(v)}</text>
+      <text x="${(bx + barW / 2).toFixed(1)}" y="${(padT + plotH + 18).toFixed(1)}" font-size="11" fill="#52514e" text-anchor="middle">${escapeHtml(b.dim)}</text>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" role="img" aria-label="المبيعات حسب الفئة">
+    <line x1="${padL}" y1="${(padT + plotH).toFixed(1)}" x2="${W - padR}" y2="${(padT + plotH).toFixed(1)}" stroke="#c3c2b7" stroke-width="1"/>
+    ${parts}
+  </svg>`;
+}
 function pageShell(title, bodyHtml) {
   return `<!DOCTYPE html>
 <html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -259,13 +415,27 @@ function loginPageHtml() {
 }
 
 function dashboardPageHtml(user, tenants) {
-  const rows = tenants.map(t => `<tr><td><code>${escapeHtml(t.hostname)}</code></td><td>${escapeHtml(t.name)}</td><td><a href="https://${escapeHtml(t.hostname)}" target="_blank">فتح ↗</a></td></tr>`).join('') || '<tr><td colspan="3" style="text-align:center;color:#888">ما سجّلتِ أي مستأجر بعد</td></tr>';
+  const rows = tenants.map((t, i) => `
+    <div class="tcard">
+      <div class="trow">
+        <code>${escapeHtml(t.hostname)}</code>
+        <a href="https://${escapeHtml(t.hostname)}" target="_blank">فتح اللوحة العامة ↗</a>
+      </div>
+      <div class="sub" style="margin:2px 0 10px">${escapeHtml(t.name)}</div>
+      <form class="salef" data-host="${escapeHtml(t.hostname)}" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;">
+        <div style="flex:1; min-width:110px;"><label style="margin:0 0 4px">مبلغ (ر.س)</label><input type="number" min="1" step="0.01" class="amount" required></div>
+        <div style="flex:1; min-width:110px;"><label style="margin:0 0 4px">الفئة</label><input class="category" placeholder="خدمات استشارية"></div>
+        <div style="flex:1; min-width:110px;"><label style="margin:0 0 4px">العميل</label><input class="customer" placeholder="اسم العميل"></div>
+        <button type="submit" style="margin:0; width:auto; padding:10px 16px;">إضافة عملية بيع</button>
+      </form>
+      <div class="msg salemsg"></div>
+    </div>`).join('') || '<p class="sub">ما سجّلتِ أي مستأجر بعد.</p>';
   return pageShell('لوحتي', `
   <div class="card">
     <h1>أهلاً، ${escapeHtml(user.email)}</h1>
-    <p style="color:#666;font-size:13px">مستأجروك (النطاقات الفرعية المسجَّلة على حسابك):</p>
-    <table><thead><tr><th>النطاق</th><th>الاسم</th><th></th></tr></thead><tbody>${rows}</tbody></table>
-    <form id="add" style="margin-top:22px; border-top:1px solid rgba(11,11,11,.08); padding-top:18px;">
+    <p class="sub">مستأجروك — لكل واحد نموذج سريع لإضافة عملية بيع حقيقية، تنعكس فوراً على لوحته العامة (KPI + رسوم بيانية) عبر الطبقة الدلالية.</p>
+    ${rows}
+    <form id="add" style="margin-top:10px; border-top:1px solid rgba(11,11,11,.08); padding-top:18px;">
       <label>نطاق فرعي جديد (بالإنجليزي، بدون مسافات)</label><input id="sub" required pattern="[a-z0-9-]+">
       <label>اسم الجهة</label><input id="name" required>
       <label>اللون الأساسي</label><input id="primary" type="color" value="#286140">
@@ -275,6 +445,7 @@ function dashboardPageHtml(user, tenants) {
     <div class="msg" id="msg"></div>
     <div class="foot"><a href="#" id="logout">تسجيل الخروج</a></div>
   </div>
+  <style>.tcard{border:1px solid rgba(11,11,11,.08); border-radius:10px; padding:14px; margin-bottom:12px;} .trow{display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;} .trow a{font-size:12px; color:#286140;}</style>
   <script>
     document.getElementById('add').addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -290,11 +461,30 @@ function dashboardPageHtml(user, tenants) {
       await fetch('/api/auth/logout', { method:'POST' });
       location.href = '/login';
     });
+    document.querySelectorAll('.salef').forEach((form) => {
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const host = form.dataset.host;
+        const amount = form.querySelector('.amount').value;
+        const category = form.querySelector('.category').value || 'عام';
+        const customer = form.querySelector('.customer').value || 'عميل';
+        const msg = form.parentElement.querySelector('.salemsg');
+        const r = await fetch('/api/tenants/' + encodeURIComponent(host) + '/sales', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amount, category, customer })
+        });
+        const data = await r.json();
+        msg.className = 'msg ' + (r.ok ? 'ok' : 'err');
+        msg.textContent = r.ok ? 'تمت الإضافة — افتحي لوحة المستأجر العامة لتشوفيها بالرسم البياني' : (data.error || 'صار خطأ');
+        if (r.ok) form.reset();
+      });
+    });
   </script>`);
 }
 
-function tenantDashboardHtml(hostname, tenant) {
+function tenantDashboardHtml(hostname, tenant, kpis, trend, byCategory) {
   const name = escapeHtml(tenant.name);
+  const hasData = Number(kpis.deal_count) > 0;
   return `<!DOCTYPE html>
 <html lang="ar" dir="rtl"><head><meta charset="UTF-8">
 <title>${name} · نسق</title>
@@ -303,13 +493,16 @@ function tenantDashboardHtml(hostname, tenant) {
   .bar{background:${tenant.primary_color}; color:#fff; padding:16px 24px; display:flex; justify-content:space-between; align-items:center;}
   .bar .host{font-family:Consolas, monospace; font-size:12px; opacity:.85; direction:ltr;}
   .wrap{max-width:720px; margin:32px auto; padding:0 20px;}
-  .card{background:#fff; border:1px solid rgba(11,11,11,.08); border-radius:14px; padding:22px; box-shadow:0 8px 24px rgba(20,20,15,.06);}
+  .card{background:#fff; border:1px solid rgba(11,11,11,.08); border-radius:14px; padding:22px; box-shadow:0 8px 24px rgba(20,20,15,.06); margin-bottom:18px;}
   .badge{display:inline-block; background:${tenant.accent_color}22; color:${tenant.accent_color}; border:1px solid ${tenant.accent_color}55; padding:4px 10px; border-radius:999px; font-size:12px; font-weight:700; margin-bottom:14px;}
   h1{margin:0 0 6px; font-size:22px;}
+  h2{font-size:15px; margin:0 0 4px; color:#0b0b0b;}
+  .sub{color:#52514e; font-size:12px; margin:0 0 12px;}
   .meta{color:#666; font-size:13px; margin-bottom:18px;}
   .kpi-row{display:grid; grid-template-columns:repeat(3,1fr); gap:10px;}
   .kpi{background:#f9f9f7; border-radius:10px; padding:14px; text-align:center;}
   .kpi b{display:block; font-size:20px;}
+  .kpi span{font-size:12px; color:#52514e;}
   footer{max-width:720px; margin:20px auto 40px; padding:0 20px; color:#8a8a86; font-size:12px;}
 </style></head>
 <body>
@@ -321,15 +514,29 @@ function tenantDashboardHtml(hostname, tenant) {
     <div class="card">
       <div class="badge">✓ تمّ التعرّف على المستأجر تلقائياً من اسم النطاق — من قاعدة بيانات حقيقية</div>
       <h1>لوحة ${name}</h1>
-      <div class="meta">مُنشأ الحساب: ${escapeHtml(String(tenant.created_at).slice(0,10))} · مساحة عمل معزولة بالكامل عن بقية المشتركين</div>
+      <div class="meta">مُنشأ الحساب: ${escapeHtml(String(tenant.created_at).slice(0, 10))} · مساحة عمل معزولة بالكامل عن بقية المشتركين</div>
       <div class="kpi-row">
-        <div class="kpi"><b>—</b>إجمالي المبيعات</div>
-        <div class="kpi"><b>—</b>عملاء نشطون</div>
-        <div class="kpi"><b>—</b>معدل التحويل</div>
+        <div class="kpi"><b>${fmtCurrency(kpis.total_sales)}</b><span>إجمالي المبيعات</span></div>
+        <div class="kpi"><b>${fmtNum(kpis.active_customers)}</b><span>عملاء نشطون</span></div>
+        <div class="kpi"><b>${fmtCurrency(kpis.avg_deal)}</b><span>متوسط الصفقة</span></div>
       </div>
     </div>
+    ${hasData ? `
+    <div class="card">
+      <h2>اتجاه المبيعات — آخر 14 يوم</h2>
+      <p class="sub">مجموع يومي، من طبقة دلالية حقيقية (measure: total_sales) فوق Postgres</p>
+      ${lineChartSvg(trend)}
+    </div>
+    <div class="card">
+      <h2>المبيعات حسب الفئة</h2>
+      <p class="sub">نفس المقياس (total_sales) مُجمَّع على بُعد مختلف (category) — بدون أي استعلام جديد مكتوب يدوياً</p>
+      ${barChartSvg(byCategory)}
+    </div>` : `
+    <div class="card">
+      <p class="sub" style="margin:0">ما فيه بيانات مبيعات لهذا المستأجر بعد. صاحب الحساب يقدر يضيف عمليات بيع من <a href="https://${APP_HOST}/dashboard">لوحته</a>.</p>
+    </div>`}
   </div>
-  <footer>هذه بيانات إثبات تقني (PoC) — لا اتصال ببيانات فعلية بعد. الهوية (${tenant.primary_color} / ${tenant.accent_color}) قُرئت من صف المستأجر في Postgres المرتبط بـ ${escapeHtml(hostname)} فقط.</footer>
+  <footer>هذه بيانات إثبات تقني (PoC). الهوية (${tenant.primary_color} / ${tenant.accent_color}) قُرئت من صف المستأجر في Postgres المرتبط بـ ${escapeHtml(hostname)} فقط. الرسوم البيانية تستخدم لوحة ألوان محايدة مُتحقَّق منها لسهولة الوصول (عمى الألوان + التباين)، وليست ألوان الهوية — لأن الأخيرة فشلت هذا الفحص عند استخدامها كسلاسل بيانات.</footer>
 </body></html>`;
 }
 
@@ -356,7 +563,7 @@ async function rootHtml() {
 code{direction:ltr;display:inline-block;background:#1a1a19;padding:2px 8px;border-radius:6px;color:#8fd6b8}
 a{color:#8fd6b8}</style></head>
 <body>
-  <h1>🟢 بيئة نسق للإثبات التقني — تعمل (v2: Postgres + مصادقة حقيقية)</h1>
+  <h1>🟢 بيئة نسق للإثبات التقني — تعمل (v3: Postgres + مصادقة حقيقية + طبقة دلالية BI)</h1>
   <p>هذا هو النطاق الجذر (<code>${ROOT_DOMAIN}</code>). المستأجرون الحاليون:</p>
   <ul>${rows}</ul>
   <p>سجّلي حساباً جديداً وأضيفي مستأجرك الخاص من نطاق التطبيق:
@@ -450,6 +657,31 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, tenants);
     }
 
+    // ---- API: إضافة عملية بيع لمستأجر (يتطلب ملكية المستأجر) ----
+    const salesMatch = url.pathname.match(/^\/api\/tenants\/([a-z0-9.-]+)\/sales$/);
+    if (salesMatch && req.method === 'POST') {
+      const session = getSessionFromReq(req);
+      if (!session) return sendJson(res, 401, { error: 'سجّلي دخولك أولاً' });
+      const targetHost = salesMatch[1];
+      const tenant = await findTenantByHost(targetHost);
+      if (!tenant) return sendJson(res, 404, { error: 'المستأجر غير موجود' });
+      if (tenant.owner_user_id !== session.uid) {
+        return sendJson(res, 403, { error: tenant.owner_user_id ? 'هذا المستأجر ما هو حسابك' : 'هذا مستأجر تجريبي للعرض فقط، ما يقبل إضافات' });
+      }
+      const data = await readJsonBody(req).catch(() => null);
+      if (!data) return sendJson(res, 400, { error: 'JSON غير صالح' });
+      const amount = Number(data.amount);
+      if (!Number.isFinite(amount) || amount <= 0) return sendJson(res, 400, { error: 'المبلغ غير صالح' });
+      const category = String(data.category || 'عام').slice(0, 60);
+      const customer = String(data.customer || 'عميل').slice(0, 80);
+      const occurredOn = /^\d{4}-\d{2}-\d{2}$/.test(data.date) ? data.date : new Date().toISOString().slice(0, 10);
+      await pool.query(
+        `INSERT INTO sales (tenant_hostname, occurred_on, category, customer_name, amount) VALUES ($1,$2,$3,$4,$5)`,
+        [targetHost, occurredOn, category, customer, amount]
+      );
+      return sendJson(res, 201, { ok: true });
+    }
+
     // ---- صفحات التطبيق (على النطاق الجذر فقط) ----
     if (isAppHost && url.pathname === '/register' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -475,8 +707,19 @@ const server = http.createServer(async (req, res) => {
 
     const tenant = await findTenantByHost(hostname);
     if (tenant) {
+      const since = new Date(Date.now() - 13 * 86400000).toISOString().slice(0, 10);
+      const kpis = await queryMeasures(hostname, ['total_sales', 'active_customers', 'avg_deal', 'deal_count'], null);
+      const trendRaw = await queryMeasures(hostname, ['total_sales'], 'day', { since });
+      // نكمل الأيام الناقصة بصفر عشان الرسم يغطي كل الـ14 يوم حتى لو ما فيه مبيعات ببعضها
+      const trendByDay = new Map(trendRaw.map((r) => [r.dim, r]));
+      const trend = [];
+      for (let dayAgo = 13; dayAgo >= 0; dayAgo--) {
+        const day = new Date(Date.now() - dayAgo * 86400000).toISOString().slice(0, 10);
+        trend.push(trendByDay.get(day) || { dim: day, total_sales: 0 });
+      }
+      const byCategory = await queryMeasures(hostname, ['total_sales'], 'category');
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      return res.end(tenantDashboardHtml(hostname, tenant));
+      return res.end(tenantDashboardHtml(hostname, tenant, kpis, trend, byCategory));
     }
 
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -491,7 +734,7 @@ const server = http.createServer(async (req, res) => {
 migrate()
   .then(() => {
     server.listen(PORT, () => {
-      console.log(`نسق PoC v2 يعمل على http://localhost:${PORT}`);
+      console.log(`نسق PoC v3 يعمل على http://localhost:${PORT}`);
       console.log(`جرّب: curl -H "Host: shorooq.${ROOT_DOMAIN}" http://localhost:${PORT}/`);
     });
   })
